@@ -7,6 +7,7 @@
 - **原子批量写入**：`POST /events/batch` 一次接收 1～100 个事件，在同一 `BEGIN IMMEDIATE` 事务中校验并落库，按数组顺序分配一段连续 revision；任一事件非法整批回滚，不留事件、不耗 revision。
 - **更正链**：更正事件通过 `correction_of` 引用已有事件（或同批更早的事件），更正本身可被再次更正（链式）。任一 revision 上，每条更正链只计**当时的末端事件**。
 - **递增 revision**：每次成功写入获得严格递增的 revision；可查询当前或任一历史 revision 的排行榜与生效明细。
+- **奖励结算预演**：`POST /rewards/preview` 基于指定 revision 的排行榜预演奖金发放——并列组共享名次区间、合并有奖名次奖金后全组均分，余下分币按 `participant_id` 升序分配；只读，不写入账本。
 - **并发安全**：写入经 `BEGIN IMMEDIATE` 串行化，revision 在写锁内分配——并发写入（含批量）不会产生重复 revision 或中间态。
 
 ## 快速启动
@@ -363,6 +364,56 @@ curl 'localhost:8000/participants/compare?left_id=alice&right_id=bob&from_revisi
 
 其中 rev2→rev3 合并为一个区间：rev3 是第三方 carol 的事件，双方分数均未变化。
 
+### 奖励结算预演 `POST /rewards/preview`
+
+基于指定 revision 的排行榜**预演**奖金发放：与 `/leaderboard` 相同的生效规则计算总分与名次，再按并列均分规则折算奖金。**只读接口，不写入账本**（不产生事件、不消耗 revision）。请求体：
+
+| 字段 | 说明 |
+|---|---|
+| `revision` | 可选。快照 revision，默认当前；`< 1` 或超过当前最大 revision 返回 `404` |
+| `prize_cents` | 必填。按名次排列的奖金（单位：分）：`prize_cents[0]` 对应第 1 名，依此类推；限 1～100 个非负整数，否则 `422` |
+
+并列与均分规则：
+
+- 总分相同者构成一个**并列组**，占据一段连续名次区间（如两人并列第 2 名，区间为 2～3）；
+- 只要组内任一名次落入有奖区（名次 ≤ `prize_cents` 长度），该组即为获奖组：把该组覆盖的**有奖名次**奖金合并后，在全组成员（含名次落在有奖区外的成员）之间均分；
+- 均分余下的分币按 `participant_id` 升序依次各补 1 分，保证发放总额等于合并池，一分不丢；
+- 完全落在有奖区之外的组不产生获奖者；有奖区比参赛人数多时，超出名次的奖金不发放。
+
+响应返回固定的 `revision`，以及每位获奖者的名次区间（`rank_start`/`rank_end`）、`total_points` 与 `prize_cents`；按名次区间升序、组内按 `participant_id` 升序排列。
+
+```bash
+# 构造数据：alice 20 分，bob / carol 并列 10 分，dave 5 分
+curl -X POST localhost:8000/events/batch -H 'Content-Type: application/json' -d '[
+  {"event_id":"r1","participant_id":"alice","points":20},
+  {"event_id":"r2","participant_id":"bob","points":10},
+  {"event_id":"r3","participant_id":"carol","points":10},
+  {"event_id":"r4","participant_id":"dave","points":5}
+]'
+
+# 预演：第 1 名 1000 分、第 2 名 500 分、第 3 名 200 分
+curl -X POST localhost:8000/rewards/preview -H 'Content-Type: application/json' -d \
+  '{"prize_cents":[1000,500,200]}'
+```
+
+```json
+{
+  "revision": 4,
+  "winners": [
+    {"participant_id": "alice", "rank_start": 1, "rank_end": 1, "total_points": 20, "prize_cents": 1000},
+    {"participant_id": "bob", "rank_start": 2, "rank_end": 3, "total_points": 10, "prize_cents": 350},
+    {"participant_id": "carol", "rank_start": 2, "rank_end": 3, "total_points": 10, "prize_cents": 350}
+  ]
+}
+```
+
+bob 与 carol 并列，共享名次区间 2～3：合并第 2、3 名奖金 `500 + 200 = 700` 后均分，各得 350。dave 第 4 名落在有奖区外，不出现在结果中。指定历史快照：
+
+```bash
+curl -X POST localhost:8000/rewards/preview -H 'Content-Type: application/json' -d \
+  '{"revision":2,"prize_cents":[1000,500]}'
+```
+
 ### 其他端点
 
 | 方法 | 路径 | 说明 |
@@ -395,7 +446,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest -v
 ```
 
-测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空账本对比、更正合并为 `replaced`、链分叉记 `added`、非一进一出不合并、before/after 完整事件、按链根排序、参数顺序 422、超范围 404、路由不被 `/events/{event_id}` 遮蔽），`/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续），以及 `/participants/{participant_id}/score-breakdown`（空账本与未知参赛者返回 0 与空数组、更正链只计末端且 history 完整、历史 revision 固定快照、revision 0 空快照、更正转移后旧参赛者不再保留该链而新归属者 history 展示此前归属、按链根升序、分叉链每末端各成一项、总分与 `/leaderboard` 一致、默认取当前 revision、负数 422、超范围 404），以及 `/participants/compare`（区间合并与边界、子范围与 `from == to`、更正改挂在同一 revision 双方同时变动、更正链只计末端、分叉链只扣一次、双方无分/未知参赛者返回覆盖全范围的 tie、双方同一人恒为 tie、空账本 0→0、区间无缝覆盖整个范围、逐 revision 与 `/leaderboard` 总分一致、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、字面路由不被遮蔽）。
+测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空账本对比、更正合并为 `replaced`、链分叉记 `added`、非一进一出不合并、before/after 完整事件、按链根排序、参数顺序 422、超范围 404、路由不被 `/events/{event_id}` 遮蔽），`/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续），以及 `/participants/{participant_id}/score-breakdown`（空账本与未知参赛者返回 0 与空数组、更正链只计末端且 history 完整、历史 revision 固定快照、revision 0 空快照、更正转移后旧参赛者不再保留该链而新归属者 history 展示此前归属、按链根升序、分叉链每末端各成一项、总分与 `/leaderboard` 一致、默认取当前 revision、负数 422、超范围 404），以及 `/participants/compare`（区间合并与边界、子范围与 `from == to`、更正改挂在同一 revision 双方同时变动、更正链只计末端、分叉链只扣一次、双方无分/未知参赛者返回覆盖全范围的 tie、双方同一人恒为 tie、空账本 0→0、区间无缝覆盖整个范围、逐 revision 与 `/leaderboard` 总分一致、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、字面路由不被遮蔽），以及 `/rewards/preview`（空账本返回 revision 0 与空获奖名单、无并列时奖金与名次一一对应、有奖区长于参赛人数时多余奖金不发放、并列组合并覆盖名次奖金均分、余下分币按 `participant_id` 升序分配且总额不变、跨有奖区边界的组只合并区内名次奖金且全组均分、区外组不获奖、名次区间跨组连续、零奖金仍列出区内成员、历史 revision 固定快照、默认取当前 revision、更正链只计末端、预演不写入账本、revision 越界 404、`prize_cents` 缺省/空数组/超 100 项/负数/非整数/非数组 422、100 项边界可用）。
 
 ## 设计要点
 
@@ -406,5 +457,6 @@ pytest -v
 - **事件差异**：`/events/changes` 复用同一生效判定取两个快照的生效事件，沿 `correction_of` 上溯到链根后按链根归组；同链根下相同 `event_id` 抵消，剩余一进一出合并为 `replaced`，否则逐项记 `added`/`removed`，按 `(chain_root, after/before 的 revision, event_id)` 排序。
 - **积分归因**：`/participants/{participant_id}/score-breakdown` 在单个读快照内取 `revision ≤ R` 的全部事件，未被更正的事件即各链生效末端；属于目标参赛者的末端沿 `correction_of` 上溯到链根，生成 `(chain_root, effective_event, history)` 三元组，按链根 `event_id` 升序输出；`total_points` 为各生效末端积分之和，与 `/leaderboard` 同 revision 的总分一致。
 - **双方对比**：`/participants/compare` 在单个读快照内取出 `revision ≤ to_revision` 的全部事件后按 revision 升序**重放**一次：事件写入即生效（更正的 revision 必然更大），被**首个**直接更正取代时失效——因此更正改挂参赛者时，原归属方扣分与新归属方加分落在同一个 revision 上；分叉更正只扣一次。重放经过 `[from_revision, to_revision]` 内每个 revision 时记录双方总分，相邻且双方分数都相同的快照合并为闭区间，与逐 revision 调用 `/leaderboard` 的结果一致。
+- **奖励预演**：`/rewards/preview` 复用 `/leaderboard` 的快照与排序（总分降序、`participant_id` 升序），把总分相同的连续条目并成并列组；组的名次区间与有奖区（名次 1～`len(prize_cents)`）相交时，合并区间内**区内名次**的奖金池，用整除在全组均分，余数按 `participant_id` 升序逐个补 1 分——发放总额恒等于奖金池。整个计算在单个 WAL 读快照内完成，不触碰写路径。
 - **并发**：所有写操作在 `BEGIN IMMEDIATE` 事务内先取写锁、再计算 `MAX(revision)+1` 并插入（批量为一段连续块），配合 `busy_timeout`，写者完全串行；读者走 WAL 快照，互不阻塞。
 - **游标分页**：`/leaderboard/page` 的游标经 HMAC-SHA256 签名（密钥来自 `LEADERBOARD_CURSOR_SECRET`），绑定 revision 与末条排序键 `(total_points, participant_id)`；续读始终落在游标指定的 revision 上，配合 WAL 快照读，写入并发进行也不会造成分页漂移。

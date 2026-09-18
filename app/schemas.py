@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, RootModel, model_validator
+from pydantic import BaseModel, Field, NonNegativeInt, RootModel, model_validator
 
 
 class EventIn(BaseModel):
@@ -176,3 +176,33 @@ class ParticipantCompareOut(BaseModel):
     from_revision: int
     to_revision: int
     intervals: List[CompareIntervalOut]
+
+
+class RewardPreviewIn(BaseModel):
+    """Write model for ``POST /rewards/preview`` (read-only; nothing is stored)."""
+
+    revision: Optional[int] = Field(
+        default=None,
+        description="Snapshot revision; defaults to the latest.",
+    )
+    prize_cents: List[NonNegativeInt] = Field(
+        min_length=1,
+        max_length=100,
+        description="Prize per rank, ordered by rank: prize_cents[0] goes to "
+        "rank 1, and so on. Ranks beyond the array earn nothing.",
+    )
+
+
+class RewardWinnerOut(BaseModel):
+    """One participant's projected prize at the snapshot revision."""
+
+    participant_id: str
+    rank_start: int = Field(description="First rank covered by this participant's tie group.")
+    rank_end: int = Field(description="Last rank covered by this participant's tie group.")
+    total_points: int
+    prize_cents: int
+
+
+class RewardPreviewOut(BaseModel):
+    revision: int
+    winners: List[RewardWinnerOut]

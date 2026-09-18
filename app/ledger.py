@@ -27,6 +27,8 @@ from .schemas import (
     LeaderboardPageOut,
     ParticipantCompareOut,
     RankPosition,
+    RewardPreviewOut,
+    RewardWinnerOut,
     ScoreBreakdownOut,
     ScoreContribution,
 )
@@ -755,3 +757,60 @@ def participant_compare(
         to_revision=to_revision,
         intervals=intervals,
     )
+
+
+def rewards_preview(
+    revision: Optional[int], prize_cents: list[int]
+) -> RewardPreviewOut:
+    """Projected prize distribution as of ``revision`` (default: latest).
+
+    Read-only: the leaderboard is computed under the same effective-event
+    rule as ``/leaderboard`` and nothing is written to the ledger. Equal
+    totals form a tie group covering a contiguous rank range. A group whose
+    range intersects the prize zone (ranks 1..len(prize_cents)) pools the
+    prizes of the covered in-zone ranks and splits the pool equally among
+    all its members; leftover cents go one each to the first members by
+    ``participant_id`` ascending, so the paid-out total always equals the
+    pooled amount. Validation matches ``/leaderboard``: a revision below 1
+    or beyond the current maximum is 404.
+    """
+    with read_tx() as conn:
+        revision = _resolve_revision(conn, revision)
+        rows = _effective_rows(conn, revision)
+
+    ordered, _details = _aggregate(rows)
+
+    # Group consecutive entries with equal totals into tie groups. Within a
+    # group the members are already ordered by participant_id ascending
+    # (that is _aggregate's tie-break), which is also the remainder order.
+    prize_ranks = len(prize_cents)
+    winners: list[RewardWinnerOut] = []
+    rank = 1
+    i = 0
+    while i < len(ordered):
+        total = ordered[i][1]
+        j = i
+        while j < len(ordered) and ordered[j][1] == total:
+            j += 1
+        group = ordered[i:j]
+        rank_start = rank
+        rank_end = rank + len(group) - 1
+        if rank_start > prize_ranks:
+            break  # later groups start even further beyond the prize zone
+        # Pool the prizes of the in-zone ranks this group covers; ranks
+        # beyond the prize zone contribute nothing.
+        pool = sum(prize_cents[rank_start - 1 : min(rank_end, prize_ranks)])
+        share, remainder = divmod(pool, len(group))
+        for k, (pid, group_total) in enumerate(group):
+            winners.append(
+                RewardWinnerOut(
+                    participant_id=pid,
+                    rank_start=rank_start,
+                    rank_end=rank_end,
+                    total_points=group_total,
+                    prize_cents=share + (1 if k < remainder else 0),
+                )
+            )
+        rank = rank_end + 1
+        i = j
+    return RewardPreviewOut(revision=revision, winners=winners)

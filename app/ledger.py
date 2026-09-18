@@ -27,6 +27,9 @@ from .schemas import (
     LeaderboardPageOut,
     ParticipantCompareOut,
     RankPosition,
+    RewardPreviewIn,
+    RewardPreviewOut,
+    RewardWinnerOut,
     ScoreBreakdownOut,
     ScoreContribution,
 )
@@ -755,3 +758,51 @@ def participant_compare(
         to_revision=to_revision,
         intervals=intervals,
     )
+
+
+def rewards_preview(preview: RewardPreviewIn) -> RewardPreviewOut:
+    """Dry-run prize settlement for the leaderboard at ``preview.revision``.
+
+    Read-only: the preview never writes to the ledger. Participants sharing a
+    total form one tie group covering a contiguous rank range
+    ``[rank_start, rank_end]``. Ranks ``1..len(prize_cents)`` form the prize
+    zone. If any rank covered by a group falls inside the zone, the prizes of
+    the covered in-zone ranks are pooled and split equally across the whole
+    group; the leftover cents go one each to the lowest ``participant_id``s,
+    so the paid-out total always equals the pooled amount. Groups fully
+    outside the zone produce no winners.
+    """
+    with read_tx() as conn:
+        revision = _resolve_revision(conn, preview.revision)
+        rows = _effective_rows(conn, revision)
+
+    ordered, _details = _aggregate(rows)
+
+    prizes = preview.prize_cents
+    winners: list[RewardWinnerOut] = []
+    i = 0
+    while i < len(ordered):
+        total = ordered[i][1]
+        j = i
+        while j < len(ordered) and ordered[j][1] == total:
+            j += 1
+        # Within a tie group `ordered` is participant_id-ascending already.
+        group = [pid for pid, _ in ordered[i:j]]
+        rank_start = i + 1
+        rank_end = j  # 1-based inclusive
+        covered = prizes[rank_start - 1 : rank_end]
+        if covered:
+            pool = sum(covered)
+            share, remainder = divmod(pool, len(group))
+            for k, pid in enumerate(group):
+                winners.append(
+                    RewardWinnerOut(
+                        participant_id=pid,
+                        rank_start=rank_start,
+                        rank_end=rank_end,
+                        total_points=total,
+                        prize_cents=share + (1 if k < remainder else 0),
+                    )
+                )
+        i = j
+    return RewardPreviewOut(revision=revision, winners=winners)

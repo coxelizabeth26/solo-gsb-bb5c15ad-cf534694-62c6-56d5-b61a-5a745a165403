@@ -16,6 +16,8 @@ from .schemas import (
     LeaderboardOut,
     LeaderboardPageOut,
     ParticipantCompareOut,
+    RewardPreviewIn,
+    RewardPreviewOut,
     ScoreBreakdownOut,
 )
 
@@ -220,3 +222,15 @@ def get_score_breakdown(
     ),
 ) -> ScoreBreakdownOut:
     return ledger.score_breakdown(participant_id, revision)
+
+
+@app.post(
+    "/rewards/preview",
+    response_model=RewardPreviewOut,
+    responses={
+        404: {"description": "Revision beyond the current maximum"},
+        422: {"description": "prize_cents is not 1–100 non-negative integers"},
+    },
+)
+def post_rewards_preview(preview: RewardPreviewIn) -> RewardPreviewOut:
+    return ledger.rewards_preview(preview)

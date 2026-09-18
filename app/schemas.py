@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import Annotated, List, Literal, Optional
 
 from pydantic import BaseModel, Field, RootModel, model_validator
 
@@ -176,3 +176,35 @@ class ParticipantCompareOut(BaseModel):
     from_revision: int
     to_revision: int
     intervals: List[CompareIntervalOut]
+
+
+class RewardPreviewIn(BaseModel):
+    """Request body for ``POST /rewards/preview`` (read-only dry run)."""
+
+    revision: Optional[int] = Field(
+        default=None,
+        description="Snapshot revision; defaults to the latest.",
+    )
+    prize_cents: List[Annotated[int, Field(ge=0)]] = Field(
+        min_length=1,
+        max_length=100,
+        description="Prize per rank in cents, ordered by rank (1st place first); "
+        "ranks 1..len(prize_cents) form the prize zone.",
+    )
+
+
+class RewardWinnerOut(BaseModel):
+    participant_id: str
+    rank_start: int = Field(
+        description="First rank covered by the winner's tie group."
+    )
+    rank_end: int = Field(
+        description="Last rank covered by the winner's tie group."
+    )
+    total_points: int
+    prize_cents: int
+
+
+class RewardPreviewOut(BaseModel):
+    revision: int
+    winners: List[RewardWinnerOut]
